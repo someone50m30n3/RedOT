@@ -1,6 +1,4 @@
-// REDoT Operator Console - JS Logic
-// Handles dynamic form creation, module execution, output streaming
-
+// REDoT Operator Console - Execution Logic (No WebSocket)
 const API = "/api";
 const terminal = document.getElementById("terminalOutput");
 const moduleSelect = document.getElementById("moduleSelect");
@@ -8,9 +6,9 @@ const paramForm = document.getElementById("inputs");
 const agentSelect = document.getElementById("agentSelect");
 const historyPanel = document.getElementById("historyLog");
 
-let socket = null;
+let currentExecId = null;
+let pollingInterval = null;
 
-// INIT
 window.onload = () => {
   loadModules();
   document.getElementById("runBtn").addEventListener("click", runModule);
@@ -19,24 +17,24 @@ window.onload = () => {
   moduleSelect.addEventListener("change", buildFormInputs);
 };
 
-// Load available modules from backend
-function loadModules() {
-  fetch(`${API}/modules`)
-    .then(res => res.json())
-    .then(modules => {
-      moduleSelect.innerHTML = "";
-      modules.forEach(mod => {
-        const opt = document.createElement("option");
-        opt.value = mod.path;
-        opt.textContent = mod.name;
-        opt.dataset.inputs = JSON.stringify(mod.inputs || []);
-        moduleSelect.appendChild(opt);
-      });
-      buildFormInputs();
-    });
+// Load modules from backend
+async function loadModules() {
+  const res = await fetch(`${API}/modules`);
+  const modules = await res.json();
+
+  moduleSelect.innerHTML = "";
+  modules.forEach(mod => {
+    const opt = document.createElement("option");
+    opt.value = mod.path;
+    opt.textContent = mod.name;
+    opt.dataset.inputs = JSON.stringify(mod.inputs || []);
+    moduleSelect.appendChild(opt);
+  });
+
+  buildFormInputs();
 }
 
-// Dynamically create input fields for selected module
+// Generate input fields from module metadata
 function buildFormInputs() {
   const selected = moduleSelect.options[moduleSelect.selectedIndex];
   const inputs = JSON.parse(selected.dataset.inputs || "[]");
@@ -57,8 +55,8 @@ function buildFormInputs() {
   });
 }
 
-// Run module and start output stream
-function runModule() {
+// Run selected module
+async function runModule() {
   const selected = moduleSelect.options[moduleSelect.selectedIndex];
   const path = selected.value;
 
@@ -70,42 +68,46 @@ function runModule() {
     }
   });
 
-  fetch(`${API}/run`, {
+  const res = await fetch(`${API}/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, inputs })
-  })
-  .then(res => res.json())
-  .then(data => {
-    const execId = data.exec_id;
-    terminal.textContent = "";
-    appendToHistory(selected.textContent, inputs);
-    connectWebSocket(execId);
   });
+
+  const data = await res.json();
+  currentExecId = data.exec_id;
+  terminal.textContent = "";
+  appendToHistory(selected.textContent, inputs);
+
+  startPollingOutput(currentExecId);
 }
 
-// Connect to WebSocket for live output
-function connectWebSocket(execId) {
-  if (socket) socket.close();
+// Poll output log until command is complete
+function startPollingOutput(execId) {
+  clearInterval(pollingInterval);
 
-  const wsUrl = `ws://${window.location.hostname}:8765/ws/${execId}`;
-  socket = new WebSocket(wsUrl);
+  pollingInterval = setInterval(async () => {
+    try {
+      const res = await fetch(`${API}/output/${execId}`);
+      const data = await res.json();
 
-  socket.onmessage = (event) => {
-    terminal.textContent += event.data;
-    terminal.scrollTop = terminal.scrollHeight;
-  };
+      if (data.log) {
+        terminal.textContent = data.log;
+        terminal.scrollTop = terminal.scrollHeight;
+      }
 
-  socket.onerror = () => {
-    terminal.textContent += "\n[!] WebSocket error.";
-  };
+      if (data.log && data.log.includes("return code") || data.log.includes("completed") || data.log.includes("exited")) {
+        clearInterval(pollingInterval);
+      }
 
-  socket.onclose = () => {
-    console.log("WebSocket closed.");
-  };
+    } catch (err) {
+      clearInterval(pollingInterval);
+      terminal.textContent += "\n[!] Output polling failed.";
+    }
+  }, 2000);
 }
 
-// Append command to history panel
+// Add to command history
 function appendToHistory(name, inputs) {
   const entry = document.createElement("div");
   entry.className = "history-entry";
@@ -123,7 +125,7 @@ function appendToHistory(name, inputs) {
   historyPanel.prepend(entry);
 }
 
-// Export log contents
+// Download log as TXT
 function downloadLog() {
   const blob = new Blob([terminal.textContent], { type: 'text/plain' });
   const url = URL.createObjectURL(blob);
